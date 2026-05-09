@@ -1,0 +1,37 @@
+# ============================================================
+# apps/langgraph-agent/requirements.txt
+# Dependências do agente LangGraph com FastAPI e Vertex AI
+# ============================================================
+
+# Framework web assíncrono para expor o agente via HTTP/SSE
+fastapi>=0.111.0
+
+# Servidor ASGI de alta performance para FastAPI
+uvicorn[standard]>=0.30.0
+
+# LangGraph — framework de agentes com grafo de estados
+langgraph>=0.2.0
+
+# LangChain Vertex AI — integração com Gemini e embeddings
+langchain-google-vertexai>=1.0.6
+
+# LangChain Core — interfaces base, mensagens, tools
+langchain-core>=0.2.10
+
+# Google Cloud BigQuery — consultas SQL e embeddings vetoriais
+google-cloud-bigquery>=3.25.0
+
+# SSE (Server-Sent Events) para streaming de respostas no FastAPI
+sse-starlette>=2.1.0
+
+# Pydantic v2 — validação de dados e modelos da API
+pydantic>=2.7.0
+
+# Autenticação Google ADC (Application Default Credentials)
+google-auth>=2.29.0
+
+# Vertex AI SDK (necessário para GenerativeModel)
+google-cloud-aiplatform>=1.60.0
+
+# Suporte a Python 3.11+ async (anyio é dependência do FastAPI)
+anyio>=4.4.0

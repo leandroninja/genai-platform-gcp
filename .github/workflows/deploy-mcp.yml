@@ -1,0 +1,384 @@
+# ============================================================
+# .github/workflows/deploy-mcp.yml
+# Deploy do MCP Server e LangGraph Agent na plataforma GenAI GCP.
+#
+# Trigger: push para main com mudanças em apps/mcp-server/** ou
+#          apps/langgraph-agent/**
+# Autenticação GCP: Workload Identity Federation (sem chaves de SA).
+# Registry: Artifact Registry (southamerica-east1)
+# Deploy: Cloud Run via gcloud CLI
+# ============================================================
+
+name: "Deploy — MCP Server & LangGraph Agent"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/mcp-server/**"
+      - "apps/langgraph-agent/**"
+      - ".github/workflows/deploy-mcp.yml"
+
+  # Execução manual via GitHub UI para deploys pontuais
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Serviço a fazer deploy"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - mcp-server
+          - langgraph-agent
+      environment:
+        description: "Ambiente de destino"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - staging
+          - prod
+
+# Permissões mínimas necessárias para Workload Identity + registry
+permissions:
+  contents: read
+  id-token: write   # Necessário para OIDC (Workload Identity Federation)
+
+env:
+  GCP_PROJECT_ID:  ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION:      ${{ vars.GCP_REGION || 'southamerica-east1' }}
+  REGISTRY:        ${{ vars.GCP_REGION || 'southamerica-east1' }}-docker.pkg.dev
+  REPOSITORY:      ${{ vars.GCP_PROJECT_ID }}/genai-prod-images
+  ENVIRONMENT:     ${{ github.event.inputs.environment || 'prod' }}
+
+jobs:
+
+  # ──────────────────────────────────────────────────────────────────
+  # Job 1: Build e Push das imagens Docker para o Artifact Registry
+  # ──────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: "Build & Push Docker Images"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      image_tag:           ${{ steps.generate-tag.outputs.tag }}
+      mcp_image:           ${{ steps.meta-mcp.outputs.tags }}
+      langgraph_image:     ${{ steps.meta-langgraph.outputs.tags }}
+      build_mcp:           ${{ steps.changes-mcp.outputs.mcp }}
+      build_langgraph:     ${{ steps.changes-langgraph.outputs.langgraph }}
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Necessário para detecção de mudanças por paths
+
+      # Autenticação GCP via OIDC — sem chaves de service account
+      - name: "Autenticar no GCP via Workload Identity Federation"
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format:               access_token
+
+      # Configura Docker para push no Artifact Registry autenticado
+      - name: "Configurar Docker para Artifact Registry"
+        run: |
+          echo "${{ steps.auth.outputs.access_token }}" | \
+            docker login -u oauth2accesstoken --password-stdin \
+            "https://${{ env.REGISTRY }}"
+
+      # Buildx para builds mais rápidos com cache GitHub Actions
+      - name: "Setup Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      # Tag única: timestamp + short SHA para rastreabilidade
+      - name: "Gerar tag imutável da imagem"
+        id: generate-tag
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+          TAG="${TIMESTAMP}-${SHORT_SHA}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Imagens serão tagueadas como: ${TAG}"
+
+      # ── Detecção de mudanças por serviço ────────────────────────
+      - name: "Detectar mudanças no MCP Server"
+        id: changes-mcp
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            mcp:
+              - 'apps/mcp-server/**'
+
+      - name: "Detectar mudanças no LangGraph Agent"
+        id: changes-langgraph
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            langgraph:
+              - 'apps/langgraph-agent/**'
+
+      # ── Build: MCP Server ────────────────────────────────────────
+      - name: "Metadata da imagem MCP Server"
+        id: meta-mcp
+        if: |
+          steps.changes-mcp.outputs.mcp == 'true' ||
+          github.event.inputs.service == 'mcp-server' ||
+          github.event.inputs.service == 'all'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/mcp-server
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.generate-tag.outputs.tag }}
+            type=sha,prefix=sha-,format=short
+
+      - name: "Build & Push — MCP Server"
+        if: |
+          steps.changes-mcp.outputs.mcp == 'true' ||
+          github.event.inputs.service == 'mcp-server' ||
+          github.event.inputs.service == 'all'
+        uses: docker/build-push-action@v5
+        with:
+          context:    apps/mcp-server
+          file:       apps/mcp-server/Dockerfile
+          platforms:  linux/amd64
+          push:       true
+          tags:       ${{ steps.meta-mcp.outputs.tags }}
+          labels:     ${{ steps.meta-mcp.outputs.labels }}
+          # Cache de build no GitHub Actions para acelerar rebuilds
+          cache-from: type=gha,scope=mcp-server
+          cache-to:   type=gha,mode=max,scope=mcp-server
+          # Gera attestations de proveniência e SBOM para supply chain security
+          provenance: true
+          sbom:       true
+
+      # ── Build: LangGraph Agent ────────────────────────────────────
+      - name: "Metadata da imagem LangGraph Agent"
+        id: meta-langgraph
+        if: |
+          steps.changes-langgraph.outputs.langgraph == 'true' ||
+          github.event.inputs.service == 'langgraph-agent' ||
+          github.event.inputs.service == 'all'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/langgraph-agent
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.generate-tag.outputs.tag }}
+            type=sha,prefix=sha-,format=short
+
+      - name: "Build & Push — LangGraph Agent"
+        if: |
+          steps.changes-langgraph.outputs.langgraph == 'true' ||
+          github.event.inputs.service == 'langgraph-agent' ||
+          github.event.inputs.service == 'all'
+        uses: docker/build-push-action@v5
+        with:
+          context:    apps/langgraph-agent
+          file:       apps/langgraph-agent/Dockerfile
+          platforms:  linux/amd64
+          push:       true
+          tags:       ${{ steps.meta-langgraph.outputs.tags }}
+          labels:     ${{ steps.meta-langgraph.outputs.labels }}
+          cache-from: type=gha,scope=langgraph-agent
+          cache-to:   type=gha,mode=max,scope=langgraph-agent
+          provenance: true
+          sbom:       true
+
+  # ──────────────────────────────────────────────────────────────────
+  # Job 2: Deploy no Cloud Run via Workload Identity
+  # ──────────────────────────────────────────────────────────────────
+  deploy-cloud-run:
+    name: "Deploy Cloud Run"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-and-push
+    # Usa environment do GitHub para aprovações e proteções de branch
+    environment: ${{ github.event.inputs.environment || 'prod' }}
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Autenticar no GCP via Workload Identity Federation"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: "Setup gcloud CLI"
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      # ── Deploy: MCP Server ───────────────────────────────────────
+      - name: "Deploy MCP Server no Cloud Run"
+        if: |
+          needs.build-and-push.outputs.build_mcp == 'true' ||
+          github.event.inputs.service == 'mcp-server' ||
+          github.event.inputs.service == 'all' ||
+          github.event_name == 'push'
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.REPOSITORY }}/mcp-server:${{ needs.build-and-push.outputs.image_tag }}"
+          SERVICE_NAME="genai-${{ env.ENVIRONMENT }}-mcp-server"
+
+          echo "Fazendo deploy do MCP Server: ${IMAGE}"
+
+          gcloud run deploy "${SERVICE_NAME}" \
+            --image="${IMAGE}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --platform=managed \
+            --min-instances=0 \
+            --max-instances=5 \
+            --cpu=1 \
+            --memory=2Gi \
+            --timeout=600 \
+            --concurrency=1 \
+            --ingress=internal-and-cloud-load-balancing \
+            --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}" \
+            --set-env-vars="VERTEX_LOCATION=${{ env.GCP_REGION }}" \
+            --set-env-vars="VERTEX_MODEL_ID=gemini-1.5-pro" \
+            --set-env-vars="BIGQUERY_DATASET=genai_platform" \
+            --set-env-vars="ENVIRONMENT=${{ env.ENVIRONMENT }}" \
+            --no-traffic \
+            --tag="deploy-${{ needs.build-and-push.outputs.image_tag }}"
+
+          # Aguarda estabilização e promove 100% do tráfego para a nova revisão
+          gcloud run services update-traffic "${SERVICE_NAME}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --to-latest
+
+          # Exibe a URL do serviço deployado
+          MCP_URL=$(gcloud run services describe "${SERVICE_NAME}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --format="value(status.url)")
+
+          echo "MCP Server deployado com sucesso: ${MCP_URL}"
+          echo "mcp_url=${MCP_URL}" >> $GITHUB_ENV
+
+      # ── Deploy: LangGraph Agent ───────────────────────────────────
+      - name: "Deploy LangGraph Agent no Cloud Run"
+        if: |
+          needs.build-and-push.outputs.build_langgraph == 'true' ||
+          github.event.inputs.service == 'langgraph-agent' ||
+          github.event.inputs.service == 'all' ||
+          github.event_name == 'push'
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.REPOSITORY }}/langgraph-agent:${{ needs.build-and-push.outputs.image_tag }}"
+          SERVICE_NAME="genai-${{ env.ENVIRONMENT }}-langgraph-agent"
+
+          echo "Fazendo deploy do LangGraph Agent: ${IMAGE}"
+
+          gcloud run deploy "${SERVICE_NAME}" \
+            --image="${IMAGE}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --platform=managed \
+            --min-instances=1 \
+            --max-instances=10 \
+            --cpu=2 \
+            --memory=4Gi \
+            --timeout=300 \
+            --concurrency=20 \
+            --ingress=internal-and-cloud-load-balancing \
+            --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}" \
+            --set-env-vars="VERTEX_LOCATION=${{ env.GCP_REGION }}" \
+            --set-env-vars="VERTEX_MODEL_ID=gemini-1.5-pro" \
+            --set-env-vars="BIGQUERY_DATASET=genai_platform" \
+            --set-env-vars="ENVIRONMENT=${{ env.ENVIRONMENT }}" \
+            --set-env-vars="AGENT_MAX_ITERATIONS=10" \
+            --no-traffic \
+            --tag="deploy-${{ needs.build-and-push.outputs.image_tag }}"
+
+          gcloud run services update-traffic "${SERVICE_NAME}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --to-latest
+
+          AGENT_URL=$(gcloud run services describe "${SERVICE_NAME}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --format="value(status.url)")
+
+          echo "LangGraph Agent deployado com sucesso: ${AGENT_URL}"
+          echo "agent_url=${AGENT_URL}" >> $GITHUB_ENV
+
+      # ── Smoke test: verifica health após deploy ──────────────────
+      - name: "Smoke test — verificar health dos serviços"
+        run: |
+          # Obtém access token para requisições autenticadas
+          ACCESS_TOKEN=$(gcloud auth print-access-token)
+
+          # Testa LangGraph Agent (tem endpoint /health HTTP)
+          AGENT_SERVICE="genai-${{ env.ENVIRONMENT }}-langgraph-agent"
+          AGENT_URL=$(gcloud run services describe "${AGENT_SERVICE}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --format="value(status.url)" 2>/dev/null || echo "")
+
+          if [ -n "$AGENT_URL" ]; then
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+              "${AGENT_URL}/health" --max-time 30)
+
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              echo "LangGraph Agent health check: OK (${HTTP_STATUS})"
+            else
+              echo "LangGraph Agent health check falhou: HTTP ${HTTP_STATUS}"
+              exit 1
+            fi
+          fi
+
+  # ──────────────────────────────────────────────────────────────────
+  # Job 3: Sumário do deploy no GitHub
+  # ──────────────────────────────────────────────────────────────────
+  notify:
+    name: "Sumário do Deploy"
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-cloud-run]
+    if: always()
+
+    steps:
+      - name: "Gerar sumário de sucesso"
+        if: needs.deploy-cloud-run.result == 'success'
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Deploy MCP & LangGraph Concluído com Sucesso
+
+          | Serviço         | Status   | Tag da Imagem |
+          |-----------------|----------|---------------|
+          | mcp-server      | Deployado | \`${{ needs.build-and-push.outputs.image_tag }}\` |
+          | langgraph-agent | Deployado | \`${{ needs.build-and-push.outputs.image_tag }}\` |
+
+          - **Ambiente**: \`${{ env.ENVIRONMENT }}\`
+          - **Projeto GCP**: \`${{ env.GCP_PROJECT_ID }}\`
+          - **Região**: \`${{ env.GCP_REGION }}\`
+          - **Commit**: \`${{ github.sha }}\`
+          - **Executado por**: \`${{ github.actor }}\`
+          - **Trigger**: \`${{ github.event_name }}\`
+          EOF
+
+      - name: "Gerar sumário de falha"
+        if: needs.deploy-cloud-run.result == 'failure'
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Deploy MCP & LangGraph FALHOU
+
+          - **Build**: ${{ needs.build-and-push.result }}
+          - **Deploy Cloud Run**: ${{ needs.deploy-cloud-run.result }}
+          - **Commit**: \`${{ github.sha }}\`
+
+          Verifique os logs do workflow para detalhes do erro.
+          EOF
+          exit 1
