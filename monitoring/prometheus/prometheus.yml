@@ -1,0 +1,167 @@
+# ============================================================
+# prometheus.yml — Configuração de scraping do Prometheus
+# Plataforma GenAI no GCP
+# ============================================================
+
+global:
+  scrape_interval: 15s          # Intervalo padrão de coleta
+  evaluation_interval: 15s      # Intervalo de avaliação de regras
+  scrape_timeout: 10s
+
+  # Labels globais adicionados a todas as séries
+  external_labels:
+    cluster: "genai-platform-gke"
+    environment: "prod"
+    region: "southamerica-east1"
+
+# ------------------------------------------------------------------
+# Arquivos de regras de alerta
+# ------------------------------------------------------------------
+rule_files:
+  - "/etc/prometheus/alerts.yml"
+
+# ------------------------------------------------------------------
+# Configuração de alertmanager
+# ------------------------------------------------------------------
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "alertmanager:9093"
+      timeout: 5s
+      api_version: v2
+
+# ------------------------------------------------------------------
+# Jobs de scraping
+# ------------------------------------------------------------------
+scrape_configs:
+
+  # Prometheus auto-monitoramento
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+    metrics_path: /metrics
+
+  # ------------------------------------------------------------------
+  # RAG Pipeline API
+  # ------------------------------------------------------------------
+  - job_name: "rag-pipeline"
+    metrics_path: /metrics
+    scheme: http
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+    static_configs:
+      - targets: ["rag-pipeline:8080"]
+        labels:
+          app: "rag-pipeline"
+          service: "genai-platform"
+          component: "rag"
+
+    # Relabeling para padronizar labels
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - replacement: "rag-pipeline"
+        target_label: job
+
+  # ------------------------------------------------------------------
+  # Agent API
+  # ------------------------------------------------------------------
+  - job_name: "agent-api"
+    metrics_path: /metrics
+    scheme: http
+    scrape_interval: 15s
+
+    static_configs:
+      - targets: ["agent-api:8080"]
+        labels:
+          app: "agent-api"
+          service: "genai-platform"
+          component: "agent"
+
+  # ------------------------------------------------------------------
+  # Node Exporter (métricas de SO dos nós GKE)
+  # ------------------------------------------------------------------
+  - job_name: "node-exporter"
+    metrics_path: /metrics
+    scheme: http
+    scrape_interval: 30s
+
+    kubernetes_sd_configs:
+      - role: node
+        kubeconfig_file: ""
+        follow_redirects: true
+
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - source_labels: [__address__]
+        regex: "([^:]+)(?::\\d+)?"
+        target_label: __address__
+        replacement: "${1}:9100"
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+
+  # ------------------------------------------------------------------
+  # kube-state-metrics (métricas de objetos Kubernetes)
+  # ------------------------------------------------------------------
+  - job_name: "kube-state-metrics"
+    metrics_path: /metrics
+    scheme: http
+    scrape_interval: 30s
+
+    static_configs:
+      - targets: ["kube-state-metrics.kube-system.svc.cluster.local:8080"]
+        labels:
+          component: "kube-state-metrics"
+
+  # ------------------------------------------------------------------
+  # cAdvisor (métricas de containers)
+  # ------------------------------------------------------------------
+  - job_name: "cadvisor"
+    metrics_path: /metrics/cadvisor
+    scheme: https
+    scrape_interval: 30s
+    tls_config:
+      insecure_skip_verify: true
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+    kubernetes_sd_configs:
+      - role: node
+
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+
+  # ------------------------------------------------------------------
+  # Pods Kubernetes com anotação prometheus.io/scrape: "true"
+  # ------------------------------------------------------------------
+  - job_name: "kubernetes-pods"
+    kubernetes_sd_configs:
+      - role: pod
+
+    relabel_configs:
+      # Apenas pods com a anotação de scrape habilitada
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      # Caminho das métricas via anotação
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      # Porta via anotação
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod

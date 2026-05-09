@@ -1,0 +1,210 @@
+# ============================================================
+# alerts.yml — Regras de Alerta do Prometheus
+# Plataforma GenAI no GCP
+# ============================================================
+
+groups:
+
+  # ------------------------------------------------------------------
+  # Alertas do RAG Pipeline
+  # ------------------------------------------------------------------
+  - name: rag_pipeline
+    interval: 30s
+    rules:
+
+      # Latência P99 do RAG Pipeline > 2 segundos
+      - alert: RAGHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(rag_request_duration_seconds_bucket{job="rag-pipeline"}[5m]))
+            by (le)
+          ) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+          service: rag-pipeline
+        annotations:
+          summary: "Latência P99 do RAG Pipeline elevada"
+          description: |
+            A latência P99 do RAG Pipeline está em {{ $value | humanizeDuration }},
+            acima do threshold de 2 segundos nos últimos 5 minutos.
+            Verifique: logs do Cloud Run, latência do BigQuery e do Vertex AI.
+          runbook_url: "https://wiki.empresa.com/runbooks/rag-high-latency"
+          dashboard_url: "https://grafana.empresa.com/d/genai-overview"
+
+      # Taxa de erros do RAG Pipeline > 1%
+      - alert: RAGHighErrorRate
+        expr: |
+          sum(rate(rag_requests_total{job="rag-pipeline", status=~"5xx"}[5m]))
+          /
+          sum(rate(rag_requests_total{job="rag-pipeline"}[5m]))
+          > 0.01
+        for: 3m
+        labels:
+          severity: critical
+          team: devops
+          service: rag-pipeline
+        annotations:
+          summary: "Taxa de erros do RAG Pipeline acima de 1%"
+          description: |
+            A taxa de erros HTTP 5xx está em {{ $value | humanizePercentage }},
+            acima do SLO de 99%. Ação imediata necessária.
+          runbook_url: "https://wiki.empresa.com/runbooks/rag-error-rate"
+
+      # RAG Pipeline sem receber requisições por 5 minutos
+      - alert: RAGNoRequests
+        expr: |
+          sum(rate(rag_requests_total{job="rag-pipeline"}[5m])) == 0
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+          service: rag-pipeline
+        annotations:
+          summary: "RAG Pipeline sem receber requisições"
+          description: |
+            O RAG Pipeline não recebeu nenhuma requisição nos últimos 5 minutos.
+            Pode indicar problema no load balancer ou no Cloud Run.
+
+      # Instâncias ativas do RAG acima de 8 (próximo do limite de 10)
+      - alert: RAGInstancesNearLimit
+        expr: rag_active_requests > 8
+        for: 2m
+        labels:
+          severity: warning
+          team: devops
+          service: rag-pipeline
+        annotations:
+          summary: "Instâncias do RAG Pipeline próximas do limite"
+          description: |
+            Há {{ $value }} requisições ativas no RAG Pipeline, próximo do limite de 10 instâncias.
+            Considere aumentar o max_instances no Cloud Run.
+
+  # ------------------------------------------------------------------
+  # Alertas do Agent API
+  # ------------------------------------------------------------------
+  - name: agent_api
+    interval: 30s
+    rules:
+
+      # Execuções do agente > 60 segundos (timeout iminente)
+      - alert: AgentHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(agent_duration_seconds_bucket{job="agent-api"}[10m]))
+            by (le)
+          ) > 60
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+          service: agent-api
+        annotations:
+          summary: "Execuções do Agent API com latência elevada"
+          description: |
+            O P95 de latência das execuções do agente está em {{ $value | humanizeDuration }}.
+            Verifique se o agente está em loop de raciocínio ou se o Vertex AI está lento.
+
+      # Taxa de falhas do agente > 5%
+      - alert: AgentHighFailureRate
+        expr: |
+          sum(rate(agent_requests_total{status="error"}[5m]))
+          /
+          sum(rate(agent_requests_total[5m]))
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+          service: agent-api
+        annotations:
+          summary: "Taxa de falha do Agent API > 5%"
+          description: |
+            {{ $value | humanizePercentage }} das execuções do agente estão falhando.
+
+  # ------------------------------------------------------------------
+  # Alertas do GKE
+  # ------------------------------------------------------------------
+  - name: gke_cluster
+    interval: 30s
+    rules:
+
+      # Nó do GKE em estado NotReady
+      - alert: GKENodeNotReady
+        expr: |
+          kube_node_status_condition{condition="Ready", status="true"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "Nó do GKE em estado NotReady: {{ $labels.node }}"
+          description: |
+            O nó {{ $labels.node }} está em estado NotReady há mais de 2 minutos.
+            Verifique o console do GKE e os logs do kubelet.
+          runbook_url: "https://wiki.empresa.com/runbooks/gke-node-not-ready"
+
+      # CPU dos nós GKE > 80%
+      - alert: GKENodeHighCPU
+        expr: |
+          100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (node)) > 80
+        for: 10m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "CPU do nó GKE > 80%: {{ $labels.node }}"
+          description: |
+            O nó {{ $labels.node }} está com {{ $value | humanize }}% de CPU.
+            Considere escalar o node pool ou redistribuir cargas.
+
+      # Memória dos nós GKE > 85%
+      - alert: GKENodeHighMemory
+        expr: |
+          (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)
+          / node_memory_MemTotal_bytes * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "Memória do nó GKE > 85%: {{ $labels.node }}"
+          description: |
+            O nó {{ $labels.node }} está com {{ $value | humanize }}% de memória utilizada.
+
+      # Pod crashloopbackoff
+      - alert: PodCrashLooping
+        expr: |
+          kube_pod_container_status_restarts_total{namespace=~"genai-.*"} > 5
+        for: 5m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "Pod em CrashLoopBackOff: {{ $labels.pod }}"
+          description: |
+            O pod {{ $labels.pod }} (container: {{ $labels.container }}) reiniciou
+            {{ $value }} vezes. Verifique os logs com: kubectl logs {{ $labels.pod }}.
+
+  # ------------------------------------------------------------------
+  # Alertas de LLM e Budget
+  # ------------------------------------------------------------------
+  - name: llm_budget
+    interval: 60s
+    rules:
+
+      # Consumo de tokens LLM acima de 800k/hora (alerta antes do 1M)
+      - alert: LLMTokenBudgetExceeded
+        expr: |
+          sum(increase(rag_requests_total{job="rag-pipeline", status="2xx"}[1h])) * 4000 > 800000
+        for: 0m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "Consumo de tokens LLM próximo do limite"
+          description: |
+            Estimativa de consumo de tokens LLM nas últimas 1h: ~{{ $value | humanize }}.
+            Threshold de alerta: 800k (limite: 1M).
+            Verifique uso anômalo ou implemente rate limiting.

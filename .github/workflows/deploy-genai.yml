@@ -1,0 +1,358 @@
+# ============================================================
+# deploy-genai.yml
+# Deploy da Plataforma GenAI: build Docker + push Artifact Registry
+# + deploy Cloud Run + deploy GKE
+# Executado em push para main quando arquivos de apps são modificados.
+# Autenticação GCP via Workload Identity Federation (sem chaves de SA).
+# ============================================================
+
+name: "Deploy — GenAI Platform"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/**"
+      - ".github/workflows/deploy-genai.yml"
+
+  # Permite execução manual via GitHub UI
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Serviço a fazer deploy (rag-pipeline, agent-api, ou all)"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - rag-pipeline
+          - agent-api
+      environment:
+        description: "Ambiente de destino"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - staging
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION || 'southamerica-east1' }}
+  REGISTRY: ${{ vars.GCP_REGION || 'southamerica-east1' }}-docker.pkg.dev
+  REPOSITORY: ${{ vars.GCP_PROJECT_ID }}/genai-prod-images
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'prod' }}
+
+jobs:
+
+  # ------------------------------------------------------------------
+  # Job 1: Build e Push das imagens Docker
+  # ------------------------------------------------------------------
+  build-and-push:
+    name: "Build & Push Docker Images"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      rag_pipeline_image: ${{ steps.meta-rag.outputs.tags }}
+      agent_api_image: ${{ steps.meta-agent.outputs.tags }}
+      image_tag: ${{ steps.generate-tag.outputs.tag }}
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Autenticar no GCP via Workload Identity"
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: "Configurar Docker para Artifact Registry"
+        run: |
+          echo "${{ steps.auth.outputs.access_token }}" | \
+            docker login -u oauth2accesstoken --password-stdin \
+            https://${{ env.REGISTRY }}
+
+      - name: "Setup Docker Buildx (multi-platform)"
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      # Gerar tag baseada no SHA do commit
+      - name: "Gerar tag da imagem"
+        id: generate-tag
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          echo "tag=${TIMESTAMP}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Tag da imagem: ${TIMESTAMP}-${SHORT_SHA}"
+
+      # ------------------------------------------------------------------
+      # Build RAG Pipeline
+      # ------------------------------------------------------------------
+      - name: "Detectar mudanças no RAG Pipeline"
+        id: changes-rag
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rag:
+              - 'apps/rag-pipeline/**'
+
+      - name: "Metadata da imagem RAG Pipeline"
+        id: meta-rag
+        if: steps.changes-rag.outputs.rag == 'true' || github.event.inputs.service == 'rag-pipeline' || github.event.inputs.service == 'all'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/rag-pipeline
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.generate-tag.outputs.tag }}
+            type=sha,prefix=sha-
+
+      - name: "Build & Push — RAG Pipeline"
+        if: steps.changes-rag.outputs.rag == 'true' || github.event.inputs.service == 'rag-pipeline' || github.event.inputs.service == 'all'
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/rag-pipeline
+          file: apps/rag-pipeline/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-rag.outputs.tags }}
+          labels: ${{ steps.meta-rag.outputs.labels }}
+          cache-from: type=gha,scope=rag-pipeline
+          cache-to: type=gha,mode=max,scope=rag-pipeline
+          provenance: true
+          sbom: true
+
+      # ------------------------------------------------------------------
+      # Build Agent API
+      # ------------------------------------------------------------------
+      - name: "Detectar mudanças no Agent API"
+        id: changes-agent
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            agent:
+              - 'apps/agent-api/**'
+
+      - name: "Metadata da imagem Agent API"
+        id: meta-agent
+        if: steps.changes-agent.outputs.agent == 'true' || github.event.inputs.service == 'agent-api' || github.event.inputs.service == 'all'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/agent-api
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.generate-tag.outputs.tag }}
+            type=sha,prefix=sha-
+
+      - name: "Build & Push — Agent API"
+        if: steps.changes-agent.outputs.agent == 'true' || github.event.inputs.service == 'agent-api' || github.event.inputs.service == 'all'
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/agent-api
+          file: apps/agent-api/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-agent.outputs.tags }}
+          labels: ${{ steps.meta-agent.outputs.labels }}
+          cache-from: type=gha,scope=agent-api
+          cache-to: type=gha,mode=max,scope=agent-api
+          provenance: true
+          sbom: true
+
+  # ------------------------------------------------------------------
+  # Job 2: Deploy no Cloud Run
+  # ------------------------------------------------------------------
+  deploy-cloud-run:
+    name: "Deploy Cloud Run"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-and-push
+    environment: ${{ github.event.inputs.environment || 'prod' }}
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Autenticar no GCP via Workload Identity"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: "Setup gcloud CLI"
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: "Deploy RAG Pipeline no Cloud Run"
+        if: github.event.inputs.service == 'rag-pipeline' || github.event.inputs.service == 'all' || github.event_name == 'push'
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.REPOSITORY }}/rag-pipeline:${{ needs.build-and-push.outputs.image_tag }}"
+          SERVICE_NAME="genai-${{ env.ENVIRONMENT }}-rag-pipeline"
+
+          gcloud run deploy "${SERVICE_NAME}" \
+            --image="${IMAGE}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --platform=managed \
+            --min-instances=1 \
+            --max-instances=10 \
+            --cpu=2 \
+            --memory=4Gi \
+            --timeout=300 \
+            --concurrency=80 \
+            --ingress=internal-and-cloud-load-balancing \
+            --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}" \
+            --set-env-vars="VERTEX_LOCATION=${{ env.GCP_REGION }}" \
+            --set-env-vars="VERTEX_MODEL_ID=gemini-pro" \
+            --set-env-vars="BIGQUERY_DATASET=genai_platform" \
+            --set-env-vars="ENVIRONMENT=${{ env.ENVIRONMENT }}" \
+            --no-traffic \
+            --tag="deploy-${{ needs.build-and-push.outputs.image_tag }}"
+
+          # Aguardar o deploy concluir e promover tráfego
+          gcloud run services update-traffic "${SERVICE_NAME}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --to-latest
+
+          echo "RAG Pipeline deployed: ${IMAGE}"
+
+      - name: "Deploy Agent API no Cloud Run"
+        if: github.event.inputs.service == 'agent-api' || github.event.inputs.service == 'all' || github.event_name == 'push'
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.REPOSITORY }}/agent-api:${{ needs.build-and-push.outputs.image_tag }}"
+          SERVICE_NAME="genai-${{ env.ENVIRONMENT }}-agent-api"
+
+          gcloud run deploy "${SERVICE_NAME}" \
+            --image="${IMAGE}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --platform=managed \
+            --min-instances=1 \
+            --max-instances=10 \
+            --cpu=2 \
+            --memory=4Gi \
+            --timeout=300 \
+            --concurrency=20 \
+            --ingress=internal-and-cloud-load-balancing \
+            --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}" \
+            --set-env-vars="VERTEX_LOCATION=${{ env.GCP_REGION }}" \
+            --set-env-vars="VERTEX_MODEL_ID=gemini-pro" \
+            --set-env-vars="BIGQUERY_DATASET=genai_platform" \
+            --set-env-vars="ENVIRONMENT=${{ env.ENVIRONMENT }}" \
+            --no-traffic \
+            --tag="deploy-${{ needs.build-and-push.outputs.image_tag }}"
+
+          gcloud run services update-traffic "${SERVICE_NAME}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --to-latest
+
+          echo "Agent API deployed: ${IMAGE}"
+
+  # ------------------------------------------------------------------
+  # Job 3: Deploy de manifestos Kubernetes no GKE
+  # ------------------------------------------------------------------
+  deploy-gke:
+    name: "Deploy GKE (Prometheus + Grafana)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-and-push
+    environment: ${{ github.event.inputs.environment || 'prod' }}
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Autenticar no GCP via Workload Identity"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: "Setup gcloud CLI e kubectl"
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          install_components: "kubectl,gke-gcloud-auth-plugin"
+
+      - name: "Configurar kubectl para o cluster GKE"
+        run: |
+          gcloud container clusters get-credentials \
+            "genai-${{ env.ENVIRONMENT }}-gke" \
+            --region="${{ env.GCP_REGION }}" \
+            --project="${{ env.GCP_PROJECT_ID }}"
+
+      - name: "Criar namespace genai se não existir"
+        run: kubectl create namespace genai --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: "Aplicar ConfigMaps do Prometheus"
+        run: |
+          kubectl create configmap prometheus-config \
+            --from-file=prometheus.yml=monitoring/prometheus/prometheus.yml \
+            --from-file=alerts.yml=monitoring/prometheus/alerts.yml \
+            --namespace=genai \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: "Aplicar ConfigMaps do Grafana"
+        run: |
+          kubectl create configmap grafana-dashboards \
+            --from-file=genai-overview.json=monitoring/grafana/dashboards/genai-overview.json \
+            --namespace=genai \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: "Rollout status — verificar saúde dos deployments"
+        run: |
+          DEPLOYMENTS=$(kubectl get deployments -n genai -o name 2>/dev/null || echo "")
+          if [ -n "$DEPLOYMENTS" ]; then
+            for deploy in $DEPLOYMENTS; do
+              echo "Verificando: $deploy"
+              kubectl rollout status "$deploy" -n genai --timeout=120s || true
+            done
+          else
+            echo "Nenhum deployment encontrado no namespace genai (infra via Terraform)"
+          fi
+
+  # ------------------------------------------------------------------
+  # Job 4: Notificação de sucesso/falha
+  # ------------------------------------------------------------------
+  notify:
+    name: "Notificação de Deploy"
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-cloud-run, deploy-gke]
+    if: always()
+
+    steps:
+      - name: "Notificação de sucesso"
+        if: needs.deploy-cloud-run.result == 'success' && needs.deploy-gke.result == 'success'
+        run: |
+          echo "## Deploy Concluído com Sucesso!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag da imagem**: \`${{ needs.build-and-push.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Ambiente**: \`${{ env.ENVIRONMENT }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Executado por**: \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: "Notificação de falha"
+        if: needs.deploy-cloud-run.result == 'failure' || needs.deploy-gke.result == 'failure'
+        run: |
+          echo "## Deploy FALHOU!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cloud Run**: ${{ needs.deploy-cloud-run.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GKE**: ${{ needs.deploy-gke.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Verifique os logs do workflow para mais detalhes." >> $GITHUB_STEP_SUMMARY
+          exit 1

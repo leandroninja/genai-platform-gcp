@@ -1,0 +1,27 @@
+# ============================================================
+# terraform.tfvars.example
+# Copie para terraform.tfvars e preencha com seus valores reais.
+# NUNCA versione o terraform.tfvars — ele está no .gitignore.
+# ============================================================
+
+# ID do projeto GCP (obrigatório)
+project_id = "meu-projeto-genai-123456"
+
+# Região principal dos recursos
+region = "southamerica-east1"
+
+# Ambiente: dev | staging | prod
+environment = "prod"
+
+# Configuração do GKE
+gke_node_count   = 2
+gke_machine_type = "n2-standard-4"
+
+# Modelo Vertex AI
+vertex_model_id = "gemini-pro"
+
+# Dataset BigQuery
+bigquery_dataset_id = "genai_platform"
+
+# E-mail para alertas de monitoramento
+alert_email = "devops@minhaempresa.com.br"

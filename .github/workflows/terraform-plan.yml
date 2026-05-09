@@ -1,0 +1,266 @@
+# ============================================================
+# terraform-plan.yml
+# Executado em Pull Requests que modificam arquivos Terraform.
+# Jobs: security-scan (tfsec + checkov) e terraform-plan com comentário no PR.
+# Autenticação GCP via Workload Identity Federation (sem chaves de SA).
+# ============================================================
+
+name: "Terraform — Plan & Security Scan"
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-plan.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write          # Necessário para Workload Identity Federation
+  security-events: write   # Necessário para upload SARIF
+
+env:
+  TF_VERSION: "1.7.4"
+  TF_WORKING_DIR: "terraform"
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION || 'southamerica-east1' }}
+
+jobs:
+
+  # ------------------------------------------------------------------
+  # Job 1: Scan de segurança (tfsec + checkov)
+  # ------------------------------------------------------------------
+  security-scan:
+    name: "Security Scan (tfsec + checkov)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # tfsec — detecta problemas de segurança no Terraform
+      - name: "tfsec — Scan de segurança Terraform"
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ env.TF_WORKING_DIR }}
+          format: sarif
+          sarif_file: tfsec-results.sarif
+          soft_fail: true
+          additional_args: "--minimum-severity HIGH"
+
+      - name: "Upload resultados tfsec para GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: tfsec-results.sarif
+          category: tfsec
+
+      # checkov — conformidade de IaC com políticas de segurança
+      - name: "Setup Python para checkov"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "Instalar checkov"
+        run: pip install checkov==3.2.0
+
+      - name: "checkov — Scan de conformidade"
+        id: checkov
+        run: |
+          checkov \
+            --directory ${{ env.TF_WORKING_DIR }} \
+            --framework terraform \
+            --output sarif \
+            --output-file-path checkov-results.sarif \
+            --soft-fail \
+            --compact \
+            --quiet \
+            --skip-check CKV_GCP_24,CKV_GCP_25 \
+          || true
+
+          # Também gerar saída legível para o log
+          checkov \
+            --directory ${{ env.TF_WORKING_DIR }} \
+            --framework terraform \
+            --compact \
+            --soft-fail \
+            --skip-check CKV_GCP_24,CKV_GCP_25 \
+            2>&1 | tee checkov-output.txt || true
+
+      - name: "Upload resultados checkov para GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+      - name: "Resumo do scan de segurança"
+        if: always()
+        run: |
+          echo "## Resultado do Scan de Segurança" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### tfsec" >> $GITHUB_STEP_SUMMARY
+          echo "Resultados disponíveis na aba Security do repositório." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### checkov" >> $GITHUB_STEP_SUMMARY
+          if [ -f checkov-output.txt ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -30 checkov-output.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ------------------------------------------------------------------
+  # Job 2: Terraform Plan
+  # ------------------------------------------------------------------
+  terraform-plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: security-scan
+
+    # Ambiente de staging para aprovação (opcional em prod)
+    environment: staging
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      # Autenticação GCP via Workload Identity Federation (sem chaves!)
+      - name: "Autenticar no GCP via Workload Identity"
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: "Setup gcloud CLI"
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: "Setup Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      - name: "Terraform Format Check"
+        id: fmt
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: "Terraform Init"
+        id: init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=terraform/state" \
+            -reconfigure
+
+      - name: "Terraform Validate"
+        id: validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate -no-color
+
+      - name: "Terraform Plan"
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var="project_id=${{ env.GCP_PROJECT_ID }}" \
+            -var="region=${{ env.GCP_REGION }}" \
+            -var="alert_email=${{ secrets.ALERT_EMAIL }}" \
+            -no-color \
+            -out=tfplan \
+            2>&1 | tee plan-output.txt
+        continue-on-error: true
+
+      # Salvar o plan como artefato
+      - name: "Upload Terraform Plan"
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.event.pull_request.number }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 7
+
+      # Publicar resultado do plan como comentário no PR
+      - name: "Comentar resultado do Plan no PR"
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.existsSync('${{ env.TF_WORKING_DIR }}/plan-output.txt')
+              ? fs.readFileSync('${{ env.TF_WORKING_DIR }}/plan-output.txt', 'utf8')
+              : 'Nenhuma saída disponível';
+
+            // Limitar tamanho para evitar limite do GitHub API
+            const truncated = planOutput.length > 60000
+              ? planOutput.substring(0, 60000) + '\n\n... [saída truncada — ver logs para detalhes completos]'
+              : planOutput;
+
+            const fmtStatus = '${{ steps.fmt.outcome }}' === 'success' ? '✅' : '❌';
+            const initStatus = '${{ steps.init.outcome }}' === 'success' ? '✅' : '❌';
+            const validateStatus = '${{ steps.validate.outcome }}' === 'success' ? '✅' : '❌';
+            const planStatus = '${{ steps.plan.outcome }}' === 'success' ? '✅' : '❌';
+
+            const body = `## Terraform Plan — Resultado
+
+            | Etapa      | Status |
+            |------------|--------|
+            | Format     | ${fmtStatus} |
+            | Init       | ${initStatus} |
+            | Validate   | ${validateStatus} |
+            | Plan       | ${planStatus} |
+
+            <details>
+            <summary>Detalhes do Plan (clique para expandir)</summary>
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+            </details>
+
+            > Gerado pelo workflow \`terraform-plan.yml\` no commit \`${{ github.sha }}\`
+            `;
+
+            // Procurar comentário anterior e atualizar
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Terraform Plan — Resultado')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: "Verificar falha no Plan"
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
