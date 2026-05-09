@@ -258,3 +258,13 @@ curl -X POST http://localhost:8081/agent/run \
 ## Licença
 
 MIT — consulte o arquivo LICENSE para detalhes.
+
+---
+
+## Autor
+
+**Leandro Oliveira Moraes**
+Arquiteto Sênior DevOps & Multi-Cloud | Segurança & FinOps
+Intel Cloud FinOps Certified | Harness Cloud Cost Management
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-leandro--oliveira--26b14768-blue?logo=linkedin)](https://linkedin.com/in/leandro-oliveira-26b14768)
