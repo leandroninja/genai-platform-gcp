@@ -1,0 +1,25 @@
+# ============================================================
+# apps/mcp-server/requirements.txt
+# Dependências do servidor MCP para a plataforma GenAI no GCP
+# ============================================================
+
+# SDK MCP — Model Context Protocol (implementação oficial Anthropic)
+mcp>=1.0.0
+
+# Google Cloud BigQuery — consultas SQL e armazenamento de embeddings
+google-cloud-bigquery>=3.25.0
+
+# Vertex AI — modelos generativos Gemini e embeddings
+google-cloud-aiplatform>=1.60.0
+
+# Cloud Monitoring — coleta de métricas de recursos GCP
+google-cloud-monitoring>=2.21.0
+
+# Pydantic — validação de dados e modelos tipados
+pydantic>=2.7.0
+
+# Autenticação Google ADC (Application Default Credentials)
+google-auth>=2.29.0
+
+# Suporte a tipos e async no Python 3.11+
+anyio>=4.4.0
