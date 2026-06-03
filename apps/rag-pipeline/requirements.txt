@@ -1,0 +1,32 @@
+# RAG Pipeline API — dependências de produção
+# Fixadas com versões mínimas testadas
+
+# Framework web
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# LangChain core e integração Vertex AI
+langchain==0.2.5
+langchain-core==0.2.9
+langchain-google-vertexai==1.0.5
+langchain-community==0.2.5
+
+# Google Cloud
+google-cloud-bigquery==3.25.0
+google-cloud-secret-manager==2.20.2
+google-cloud-aiplatform==1.57.0
+google-auth==2.30.0
+
+# Métricas Prometheus
+prometheus-client==0.20.0
+
+# Validação e serialização
+pydantic==2.7.3
+pydantic-settings==2.3.4
+
+# Computação vetorial
+numpy==1.26.4
+
+# Utilitários
+python-dotenv==1.0.1
+httpx==0.27.0
